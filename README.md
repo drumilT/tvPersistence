@@ -1,8 +1,8 @@
 # tvPersistence.jl
 
-The code has been developed in Julia as a code accompanying the Barunik and Vacha (2022) paper, and provides estimation of time-varying persistence using *distributional deep learning* introduced in
+The code has been developed in Julia as a code accompanying the Barunik and Vacha (2023) paper, and provides estimation of time-varying persistence using *localised heterogeneous persistence* introduced in
 
-Baruník, J. and Vacha, L. (2022): *Time-Varying Persistence of Economic Variables*, manuscript [available here for download](https://barunik.github.io)
+Baruník, J. and Vacha, L. (2023): *The Dynamic Persistence of Economic Shocks*, manuscript [available here for download](https://barunik.github.io)
 
 
 ## Software requirements
