@@ -4,7 +4,7 @@ The code has been developed in Julia as a code accompanying the Barunik and Vach
 
 Baruník, J. and Vacha, L. (2023): *The Dynamic Persistence of Economic Shocks*, manuscript [available here for download](https://ideas.repec.org/p/arx/papers/2306.01511.html)
 
-Baruník, J. and Vacha, L. (2024): *Forecasting Volatility of Oil-based Commodities: The Model of Dynamic Persistence*, manuscript [available here for download](https://ideas.repec.org/p/arx/papers/2306.01511.html)
+Baruník, J. and Vacha, L. (2024): *Forecasting Volatility of Oil-based Commodities: The Model of Dynamic Persistence*, manuscript [available here for download](https://arxiv.org/pdf/2402.01354.pdf)
 
 ## Software requirements
 
