@@ -41,7 +41,7 @@ Load example data
 
 ```julia
 data_read=CSV.File("data.csv",missingstring=["NA"],header=true) |> DataFrame;
-dat0=10.0.*sqrt.(data_read.CL[ismissing.(data_read.CL).==false]);
+dat0=data_read.CL[ismissing.(data_read.CL).==false];
 ```
 
 ### Part 1: Plot the decomposition
@@ -118,7 +118,7 @@ Example of h=1 step ahead forecast
 
 
 ```julia
-data0=sqrt.(data_read.CL[ismissing.(data_read.CL).==false])[1:800];
+data0=data_read.CL[ismissing.(data_read.CL).==false][1:800];
 ```
 
 
