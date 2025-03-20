@@ -1,0 +1,675 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# --- Core Imports ---
+# Import standard libraries and packages required for data processing, visualization, modeling, and forecasting.
+import os
+import sys
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import statsmodels.api as sm
+from scipy import stats
+from scipy.stats import norm, pearsonr
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
+from sklearn.linear_model import ElasticNet
+import statsmodels.api as sm
+from sklearn.model_selection import KFold
+from sklearn.impute import SimpleImputer
+import lightgbm as lgb
+from lightgbm import LGBMRegressor
+from itertools import product
+import warnings
+warnings.filterwarnings("ignore")
+
+# --- QBT Configuration ---
+# Set configuration variables for QBT and append QBT library path for module imports.
+__QBTCOMMON_VERSION__ = '1.11.2'
+__QBTCOMMON_PATH__ = '/q/common/exec/py/{version}/lib/python3.9/site-packages/'
+sys.path.append(__QBTCOMMON_PATH__.format(version=__QBTCOMMON_VERSION__))
+
+import qbtcommon, qbtcommon.region
+from qbtcommon import cds_paths, cds_utils
+
+# --- Kernel Functions ---
+def gaussian_kernel(distance, scale):
+    # Return weights based on the Gaussian kernel function.
+    return np.exp(-0.5 * (distance / scale) ** 2)
+
+def epanechnikov_kernel(scaled_distance, smoothing_param):
+    # Compute the Epanechnikov kernel weights.
+    u_scaled = scaled_distance / smoothing_param
+    return 0.75 * (1 - u_scaled ** 2) * (np.abs(u_scaled) <= 1)
+
+def uniform_kernel(distance, scale):
+    # Return weights using the uniform kernel (1 within scale and 0 outside).
+    return (np.abs(distance / scale) <= 1).astype(float)
+
+# --- Estimation Core ---
+def ols_estimator(y, X):
+    """Simple OLS estimator"""
+    # Ensure X is a 2D array; reshape if it is one-dimensional.
+    X = np.array(X)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    # Compute the inverse of X'X and then estimate coefficients via OLS.
+    XtX_inv = np.linalg.inv(X.T @ X)
+    return XtX_inv @ X.T @ y
+
+def elasticnet_estimator(y, X, alpha=0.001, l1_ratio=0.5):
+    """
+    ElasticNet estimator with regularization that handles NaNs in X using linear interpolation.
+    
+    For each column in X, missing values are replaced by linearly interpolated values.
+    If an entire column is NaN, it is filled with 0.
+    """
+    X = np.array(X)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    
+    # Create a copy of X for imputation.
+    X_imputed = np.copy(X)
+    n_rows, n_cols = X_imputed.shape
+    
+    # Impute each column using linear interpolation.
+    for col in range(n_cols):
+        col_data = X_imputed[:, col]
+        nan_mask = np.isnan(col_data)
+        
+        # If the entire column is NaN, fill it with 0.
+        if np.all(nan_mask):
+            X_imputed[:, col] = 0
+        # Otherwise, perform linear interpolation for NaNs.
+        elif np.any(nan_mask):
+            x_axis = np.arange(n_rows)
+            # Indices and values of non-NaN elements.
+            valid = ~nan_mask
+            valid_indices = x_axis[valid]
+            valid_values = col_data[valid]
+            # Use np.interp to fill NaNs; this automatically extrapolates at the boundaries.
+            col_data = np.interp(x_axis, valid_indices, valid_values)
+            X_imputed[:, col] = col_data
+    
+    # Fit an ElasticNet model without intercept.
+    model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, fit_intercept=False)
+    model.fit(X_imputed, y)
+    return model.coef_
+
+def select_optimal_bandwidth(model_function, dependent_var, bandwidth_range, kernel_function, n_folds=5, **model_kwargs):
+    # Select the optimal bandwidth parameter using K-fold cross-validation.
+    n = len(dependent_var)
+    kf = KFold(n_splits=n_folds)
+    cv_scores = []
+
+    # Loop through each candidate bandwidth.
+    for bw in bandwidth_range:
+        fold_scores = []
+        for train_idx, val_idx in kf.split(dependent_var):
+            train_data = dependent_var[train_idx]
+            # Obtain model output and residuals for the training split.
+            _, residuals = model_function(train_data, bw, kernel_function, **model_kwargs)
+            
+            val_data = dependent_var[val_idx]
+            # Obtain model output and residuals for the validation split.
+            _, val_residuals = model_function(val_data, bw, kernel_function, **model_kwargs)
+            
+            # Calculate mean squared error on validation residuals.
+            mse = np.mean(val_residuals**2)
+            fold_scores.append(mse)
+        
+        # Average score over all folds.
+        cv_scores.append(np.mean(fold_scores))
+    
+    # Choose the bandwidth with the minimum CV score.
+    optimal_bandwidth = bandwidth_range[np.argmin(cv_scores)]
+    return optimal_bandwidth
+
+def estimate_time_varying_constant(dependent_var, bandwidth, kernel_function):
+    # Estimate a time-varying constant (local intercept) using kernel weighting.
+    n = len(dependent_var)
+    t_over_T = np.linspace(0, 1, n)
+    intercepts = np.zeros(n)
+
+    # Loop over each time point to calculate the local intercept.
+    for i, u in enumerate(t_over_T):
+        distances = t_over_T - u
+        weights = kernel_function(distances, bandwidth)
+        weights /= weights.sum()  # Normalize weights.
+        W = np.diag(weights)
+        X_u = np.ones((n, 1))  # Design matrix with constant term.
+        XWX = X_u.T @ W @ X_u
+        XWy = X_u.T @ W @ dependent_var
+        
+        try:
+            # Solve for the local intercept.
+            beta = np.linalg.solve(XWX, XWy)
+            intercepts[i] = beta[0]
+        except np.linalg.LinAlgError:
+            intercepts[i] = np.nan
+
+    residuals = dependent_var - intercepts
+    return intercepts, residuals
+
+def create_lagged_matrix(time_series, lag_order):
+    # Create a lagged matrix for autoregressive modeling.
+    T = len(time_series)
+    X = np.zeros((T - lag_order, lag_order))
+    for i in range(lag_order):
+        X[:, i] = time_series[lag_order - i - 1:T - i - 1]
+    y = time_series[lag_order:]
+    return X, y
+
+# --- AR Estimation Methods ---
+def estimate_time_varying_ar_coefficients_ls(time_series, lag_order, bandwidth, kernel_func=gaussian_kernel):
+    # Estimate time-varying AR coefficients using local least squares regression.
+    X, y = create_lagged_matrix(time_series, lag_order)
+    T = len(y)
+    t_rescaled = np.linspace(0, 1, T)
+    ar_estimates = np.zeros((T, lag_order))
+    
+    # Loop over each time point to compute weighted least squares estimates.
+    for t in range(T):
+        t0 = t_rescaled[t]
+        distances = t_rescaled - t0
+        weights = kernel_func(distances, bandwidth)
+        W = np.diag(weights)
+        A = X.T @ W @ X
+        # Use pseudo-inverse for stability in case A is singular or ill-conditioned.
+        A_inv = np.linalg.pinv(A)
+        ar_estimates[t] = A_inv @ (X.T @ W @ y)
+    
+    # Compute fitted values and residuals.
+    fitted_values = np.sum(ar_estimates * X, axis=1)
+    residuals = y - fitted_values
+    return ar_estimates, residuals, fitted_values
+
+def estimate_constant_burg_coefficients(time_series, lag_order):
+    """Calculate AR coefficients using Burg's method"""
+    # Use Burg's method from statsmodels to estimate AR coefficients.
+    coeffs, var = sm.regression.linear_model.burg(time_series, order=lag_order)
+    X, y = create_lagged_matrix(time_series, lag_order)
+    preds = np.sum(coeffs * X, axis=1)
+    residuals = y - preds
+    return coeffs, residuals, preds
+
+def irf_forecast_horizon(sample_length, max_ar_lag, wold_coefs, reversed_innovations,
+                         max_scale_lag, scale_level, forecast_horizon):
+    """
+    Calculate multiscale Impulse Response Functions with a specified forecasting horizon.
+    
+    Parameters
+    ----------
+    sample_length : int
+        Length of the sample (T).
+    max_ar_lag : int
+        Maximum lag in the baseline AR (maxAR).
+    wold_coefs : array_like
+        Vector of classical Wold coefficients.
+    reversed_innovations : array_like
+        Vector of unit-variance classical Wold innovations in reverse order (eps).
+    max_scale_lag : int
+        Maximum lag on scales.
+    scale_level : int
+        Scale 
+    forecast_horizon : int
+        Maximum lag in forecasts.
+        
+    Returns
+    -------
+    tuple
+        (beta_matrix, forecast_vector) where:
+        - beta_matrix: Matrix of multiscale IRF coefficients Beta(k, p) at the given scale.
+          Its dimensions are ((M - forecast_horizon) / (2^scale_level) - 1, forecast_horizon).
+        - forecast_vector: Vector of forecasts for the sum of subsequent values,
+          with dimensions (sample_length - max_ar_lag - max_scale_lag + 1,).
+
+    Notes
+    -----
+    - All processes are assumed to have ZERO MEAN.
+    - beta_matrix has dimensions ((M - forecast_horizon) / (2^scale_level) - 1, forecast_horizon).
+    - forecast_vector has dimensions (sample_length - max_ar_lag - max_scale_lag + 1,).
+    """
+
+    # Convert inputs to numpy arrays.
+    wold_coefs = np.array(wold_coefs)
+    reversed_innovations = np.array(reversed_innovations)
+
+    # -----------------------------------------------------
+    # 1) Calculate the Beta coefficients (beta_matrix)
+    # -----------------------------------------------------
+
+    # Calculate the length of the Wold coefficients.
+    wold_length = len(wold_coefs)
+
+    # Determine the dimensions of the beta_matrix.
+    beta_rows = int(np.floor((wold_length - forecast_horizon) / (2 ** scale_level))) - 1
+    beta_matrix = np.zeros((beta_rows, forecast_horizon))
+
+    # Fill beta_matrix by applying a wavelet-like transform to wold_coefs.
+    for p in range(forecast_horizon):  # p goes from 0 to forecast_horizon-1.
+        for k in range(beta_rows):     # k goes from 0 to beta_rows-1.
+            start_index = k * 2 ** scale_level + p
+            mid_index = start_index + 2 ** (scale_level - 1)
+            end_index = start_index + 2 ** scale_level
+
+            # Sum of first half minus sum of second half, normalized by sqrt(2^scale_level).
+            beta_matrix[k, p] = (
+                np.sum(wold_coefs[start_index:mid_index])
+                - np.sum(wold_coefs[mid_index:end_index])
+            ) / np.sqrt(2 ** scale_level)
+
+    # -----------------------------------------------------
+    # 2) Apply the same wavelet-like transform to reversed_innovations (eps_scale)
+    # -----------------------------------------------------
+    # Length for eps_scale = (sample_length - max_ar_lag - 2^scale_level + 1).
+    eps_scale_length = sample_length - max_ar_lag - 2 ** scale_level + 1
+    eps_scale = np.zeros(eps_scale_length)
+
+    # Compute eps_scale using the wavelet transform.
+    for t in range(eps_scale_length):
+        eps_scale[t] = (
+            np.sum(reversed_innovations[t : t + 2 ** (scale_level - 1)])
+            - np.sum(
+                reversed_innovations[t + 2 ** (scale_level - 1) : t + 2 ** scale_level]
+            )
+        ) / np.sqrt(2 ** scale_level)
+
+    # -----------------------------------------------------
+    # 3) Accumulate forecasts using the beta_matrix and eps_scale
+    # -----------------------------------------------------
+
+    # Prepare a matrix to accumulate forecasts for each horizon.
+    forecast_matrix_length = sample_length - max_ar_lag - max_scale_lag + 1
+    forecast_matrix = np.zeros((forecast_matrix_length, forecast_horizon))
+
+    # Multiply beta coefficients by the appropriately shifted eps_scale values.
+    for p in range(forecast_horizon):
+        for t in range(forecast_matrix_length):
+            max_k = int(np.floor((max_scale_lag - forecast_horizon) / (2 ** scale_level))) - 1
+            for k in range(max_k):
+                forecast_matrix[t, p] += beta_matrix[k, p] * eps_scale[t + k * 2 ** scale_level]
+
+    # Sum across all horizons to obtain the final forecast vector.
+    forecast_vector = np.sum(forecast_matrix, axis=1)    
+
+    # Reverse the forecast vector order.
+    return beta_matrix, forecast_vector[::-1]
+
+def estimate_time_varying_ar_coefficients_burg(time_series, lag_order, bandwidth, kernel_function=gaussian_kernel):
+    # Estimate time-varying AR coefficients using a kernel-weighted Burg's method.
+    T = len(time_series)
+    ar_coeffs = np.zeros((T, lag_order))
+    predictions = np.zeros(T)
+    residuals = np.zeros(T)
+    t_values = np.linspace(0, 1, T)
+
+    # Loop over each time point.
+    for t in range(T):
+        time_diff = np.abs(t_values - t_values[t])
+        weights = kernel_function(time_diff, bandwidth)
+        weights /= weights.sum()
+        
+        # Apply weights to the time series.
+        weighted_series = time_series * np.sqrt(weights)
+        # Burg's method implementation using weighted series.
+        n = len(weighted_series)
+        ef = weighted_series.to_numpy().copy()
+        eb = weighted_series.to_numpy().copy()
+        a = np.ones(1)
+        
+        # Iteratively compute AR coefficients using reflection coefficients.
+        for m in range(lag_order):
+            # Compute reflection coefficient (k) using Burg's algorithm.
+            numerator = 2 * np.dot(ef[m+1:], eb[m:-1])
+            denominator = np.dot(ef[m+1:], ef[m+1:]) + np.dot(eb[m:-1], eb[m:-1])
+            k = numerator / denominator
+           
+            # Update AR coefficients.
+            a = np.append(a, 0) - k * np.append(0, a[::-1])
+            # Update forward and backward prediction errors.
+            ef_new = ef[m+1:] - k * eb[m:-1]
+            eb_new = eb[m:-1] - k * ef[m+1:]
+            ef, eb = ef_new, eb_new
+        
+        # Store the estimated AR coefficients.
+        ar_coeffs[t] = -a[1:]
+        # Compute predictions and residuals if enough lags are available.
+        if t >= lag_order:
+            lags = time_series[t-lag_order:t][::-1]
+            predictions[t] = np.dot(ar_coeffs[t], lags)
+            residuals[t] = time_series[t] - predictions[t]
+    return ar_coeffs, residuals, predictions
+
+# --- Stability and IRF Computations ---
+def is_stable(ar_coeffs):
+    # Check AR model stability via the roots of the characteristic polynomial.
+    roots = np.roots(np.concatenate(([1], -ar_coeffs)))
+    return np.all(np.abs(roots) < 1)
+
+def compute_irf(ar_coeffs, residuals, max_ar_order, irf_horizon):
+    """Compute impulse response function with stability checks"""
+    # Calculate the variance of residuals.
+    n_eff = max(len(residuals) - max_ar_order, 1)
+    sigma2 = (residuals.T @ residuals) / n_eff
+    sigma = np.sqrt(sigma2)
+    standardized_residuals = residuals / sigma
+
+    # Initialize the impulse response function (IRF) with the first element as sigma.
+    irf = np.zeros(irf_horizon)
+    irf[0] = sigma
+    final_ar_coeffs = ar_coeffs[-1, :]
+
+    # Check if the AR model is stable; if not, raise an error.
+    if not is_stable(final_ar_coeffs):
+        raise ValueError("Warning: AR coefficients unstable, increase bandwidth")
+        final_ar_coeffs = final_ar_coeffs / (1.1 * np.max(np.abs(final_ar_coeffs)))
+
+    # Compute IRF recursively.
+    for i in range(1, irf_horizon):
+        cumulative_effect = 0.0
+        for lag in range(1, min(i, max_ar_order) + 1):
+            cumulative_effect += irf[i - lag] * final_ar_coeffs[lag-1]
+        irf[i] = cumulative_effect
+
+    return irf, standardized_residuals
+
+# --- Multiscale Decomposition ---
+def decompose_multiscale_irf(sample_length, max_ar_lag, wold_coeffs, 
+                            reversed_innovations, max_scale_lag, scale_level):
+    """Wavelet-based multiscale decomposition preserving g_scale checks"""
+    wold_coeffs = np.array(wold_coeffs)
+    reversed_innovations = np.array(reversed_innovations)
+    block_size = 2 ** scale_level
+    half_block = 2 ** (scale_level - 1)
+    
+    # Beta scale calculation: decompose Wold coefficients into scales.
+    n_beta = len(wold_coeffs) // block_size
+    beta_scale = np.zeros(n_beta)
+    
+    for k in range(n_beta):
+        start_idx = k * block_size
+        beta_scale[k] = (np.sum(wold_coeffs[start_idx:start_idx+half_block]) - 
+                        np.sum(wold_coeffs[start_idx+half_block:start_idx+block_size])) / np.sqrt(block_size)
+
+    # Epsilon scale calculation: apply similar transform to reversed innovations.
+    eps_scale_length = sample_length - max_ar_lag - block_size + 1
+    eps_scale = np.zeros(eps_scale_length)
+    
+    for t in range(eps_scale_length):
+        eps_scale[t] = (np.sum(reversed_innovations[t:t+half_block]) - 
+                       np.sum(reversed_innovations[t+half_block:t+block_size])) / np.sqrt(block_size)
+
+    # G-scale calculation: accumulate forecasts over scales.
+    g_scale_length = sample_length - max_ar_lag - max_scale_lag + 1
+    g_scale = np.zeros(g_scale_length)
+    n_beta_max_scale = max_scale_lag // block_size
+    
+    for t in range(g_scale_length):
+        cumulative_sum = 0.0
+        for k in range(n_beta_max_scale):
+            if k < len(beta_scale) and (t + k * block_size) < len(eps_scale):
+                cumulative_sum += beta_scale[k] * eps_scale[t + k * block_size]
+        g_scale[t] = cumulative_sum
+
+    # Reverse and decimate g_scale for additional analysis.
+    chron_g_scale = g_scale[::-1]
+    decim_g_scale = g_scale[::block_size]
+    plot_extra = False
+
+    # Preserved g_scale validation checks: flag if g_scale exceeds expected range.
+    if np.max(g_scale) > 2 or np.min(g_scale) < -2:
+        print(f"g_scale range: [{np.min(g_scale):.2f}, {np.max(g_scale):.2f}]")
+        plot_extra = True
+
+    return beta_scale, eps_scale, g_scale, chron_g_scale, decim_g_scale, plot_extra
+
+# --- Forecasting Functions ---
+def forecast_constant_component(time_series, lag_order, bandwidth, kernel_func, forecast_horizon):
+    """Forecast constant component using time-varying AR model"""
+    # Estimate time-varying AR coefficients.
+    ar_coefficients, _, _ = estimate_time_varying_ar_coefficients_ls(
+        time_series, lag_order, bandwidth, kernel_func
+    )
+    
+    # Use the most recent lag values for forecasting.
+    initial_lags = time_series[-lag_order:]
+    forecasts = np.zeros(forecast_horizon)
+    
+    # Forecast using available AR coefficients.
+    for h in range(min(lag_order, forecast_horizon)):
+        forecasts[h] = ar_coefficients[-1] @ initial_lags[-lag_order + h:]
+    
+    for h in range(lag_order, forecast_horizon):
+        forecasts[h] = ar_coefficients[-1] @ forecasts[h - lag_order:h][::-1]
+    
+    # Return the mean forecast over the horizon.
+    return np.mean(forecasts)
+
+def time_varying_ewd_forecast(
+    volatility_series,
+    outsample_start_date,
+    window_size,
+    forecast_horizon,
+    max_autoregressive_lag,
+    max_wavelet_scale,
+    bandwidth_constant,
+    bandwidth_tvp_ar,
+    bandwidth_forecast
+):
+    """
+    Estimates time-varying Equilibrium Wavelet Decomposition (EWD) forecasts 
+    of a given volatility series.
+
+    Parameters
+    ----------
+    volatility_series : pd.Series
+        Time series data of the volatility.
+    outsample_start_date : str or pd.Timestamp
+        Start date for out-of-sample forecast.
+    window_size : int
+        Lookback window size for in-sample estimation.
+    forecast_horizon : int
+        Number of steps to forecast ahead.
+    max_autoregressive_lag : int
+        Maximum autoregressive lag order to consider.
+    max_wavelet_scale : int
+        Maximum wavelet scale (J).
+    bandwidth_constant : float
+        Bandwidth parameter for estimating time-varying constants.
+    bandwidth_tvp_ar : float
+        Bandwidth parameter for estimating time-varying AR coefficients.
+    bandwidth_forecast : float
+        Bandwidth parameter for forecasting the constant component.
+    
+    Returns
+    -------
+    forecasts : pd.Series
+        Forecast values for the out-of-sample period.
+    actual_values : pd.Series
+        Actual (or target) values for the same out-of-sample period.
+    forecast_errors : pd.Series
+        Forecast errors (forecasts - actual_values).
+    """
+    # Validate forecast horizon.
+    if forecast_horizon < 1 :
+        raise ValueError("Forecast Horizon cannot be less than 1")
+    outsample_start = volatility_series.index.get_loc(
+        volatility_series.index[volatility_series.index >= outsample_start_date][0]
+    )
+    if outsample_start < window_size + forecast_horizon :
+        raise ValueError("Look back too long for outsample. Decrease lookback or predicted values.")
+
+    estimation_points = len(volatility_series) - outsample_start
+
+    # Compute rolling averages using a sliding window.
+    rolling_averages = pd.Series(
+        np.mean(np.lib.stride_tricks.sliding_window_view(volatility_series, forecast_horizon), axis=1),
+        index=volatility_series.index[forecast_horizon - 1:]
+    )
+
+    # Calculate IRF horizon based on wavelet scale and window size.
+    irf_horizon = int(
+        2 ** max_wavelet_scale 
+        * (np.floor((window_size - max_autoregressive_lag) / (2 ** max_wavelet_scale)) - 1)
+    )
+    if irf_horizon == 0:
+        raise ValueError("IRF horizon is too small. Reduce max_wavelet_scale or increase window_size.")
+
+    scale_horizon = int(irf_horizon/2)
+    
+    forecasts_index = volatility_series.index[outsample_start:]
+    forecasts = pd.Series(np.zeros(estimation_points), index=forecasts_index)
+    forecast_mat = pd.DataFrame(np.zeros((estimation_points,max_wavelet_scale+1)), index=forecasts_index, columns=[f'wave_{i}' for i in range(max_wavelet_scale+1)])
+
+    print("Number of points estimated: ",estimation_points)
+    # -----------------------------------------------------
+    # 1) Out-of-sample forecasting loop
+    # -----------------------------------------------------
+    for index in tqdm(range(outsample_start, outsample_start + estimation_points)):
+        # Determine the estimation window.
+        window_end = index - forecast_horizon
+        window_start = window_end - window_size
+
+        data_window = volatility_series[window_start:window_end]
+        
+        # Estimate time-varying constant and compute residuals.
+        time_varying_constant, residuals = estimate_time_varying_constant(
+            data_window,
+            bandwidth_constant,
+            epanechnikov_kernel
+        )
+
+        # Estimate AR coefficients using time-varying Burg's method.
+        ar_coefficients, residuals, forecasts_ar  = estimate_time_varying_ar_coefficients_burg(
+            residuals,
+            max_autoregressive_lag,
+            bandwidth_tvp_ar,
+            epanechnikov_kernel
+        )
+        
+        # # Alternative to construct ar_coefficients if time varying Burg is unstable
+        # #------------------------------------------------------------------------------------------------------------------------------------------------------------
+        # # Estimate AR coefficients using constant Burg's method.
+        # ar_coefficients, residuals, _ = estimate_constant_burg_coefficients(data_window, max_autoregressive_lag)
+        # ar_coefficients = np.tile(ar_coefficients, (len(residuals), 1))
+        # # ------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+        
+    
+        # Compute impulse response functions.
+        ma_alpha_coefficients, standard_residuals = compute_irf(
+            ar_coefficients,
+            residuals,
+            max_autoregressive_lag,
+            irf_horizon
+        )
+        # -----------------------------------------------------
+        # 2) Multiscale decomposition using IRF
+        # -----------------------------------------------------
+        wavelet_scales = []
+        wavelet_components = []
+
+        # Loop over wavelet scales.
+        for scale_level in range(1, max_wavelet_scale + 1):
+            (beta_scale,
+             eps_scale,
+             g_scale,
+             chron_g_scale,
+             decim_g_scale, plt_es) = decompose_multiscale_irf(
+                 sample_length=window_size,
+                 max_ar_lag=max_autoregressive_lag,
+                 wold_coeffs=ma_alpha_coefficients,
+                 reversed_innovations=standard_residuals[::-1],
+                 max_scale_lag=scale_horizon,
+                 scale_level=scale_level
+            )
+            wavelet_scales.append(beta_scale)
+            wavelet_components.append(chron_g_scale)
+        
+        # Form a matrix of wavelet components.
+        wavelet_matrix = np.column_stack(wavelet_components)
+
+        # Prepare regression matrix by combining constant component and wavelet scales.
+        regression_matrix = np.column_stack([
+            time_varying_constant[-len(wavelet_components[0]):],
+            wavelet_matrix
+        ])
+        regression_coefficients = elasticnet_estimator(
+            data_window[-len(wavelet_components[0]):],
+            regression_matrix
+        )
+
+        # Forecast the constant component.
+        constant_forecast = forecast_constant_component(
+            time_series=time_varying_constant,
+            lag_order=1,
+            bandwidth=bandwidth_forecast,
+            kernel_func=epanechnikov_kernel,
+            forecast_horizon=forecast_horizon
+        )
+
+        # -----------------------------------------------------
+        # 3) Forecast each scale-level wavelet component
+        # -----------------------------------------------------
+        forecasted_wavelets = []
+        for scale_level in range(1, max_wavelet_scale + 1):
+            _, wavelet_forecast = irf_forecast_horizon(
+                sample_length=window_size,
+                max_ar_lag=max_autoregressive_lag,
+                wold_coefs=ma_alpha_coefficients,
+                reversed_innovations=standard_residuals[::-1],
+                max_scale_lag=scale_horizon,
+                scale_level=scale_level,
+                forecast_horizon=forecast_horizon
+            )
+            forecasted_wavelets.append(wavelet_forecast)
+
+        # Combine constant forecast with wavelet forecasts.
+        forecast_matrix = np.column_stack([
+            constant_forecast * np.ones(len(forecasted_wavelets[0])),
+            np.column_stack(forecasted_wavelets)
+        ])
+        # -----------------------------------------------------
+        # 4) Final point forecast
+        # -----------------------------------------------------
+        date = volatility_series.index[window_end + forecast_horizon]
+
+        forecasts[date] = (
+            (1 / forecast_horizon * forecast_matrix[-1]) @ 
+            np.concatenate([[forecast_horizon * regression_coefficients[0]], regression_coefficients[1:]])
+        )
+        
+        forecast_mat.loc[date] = forecast_matrix[-1]
+        
+
+    return forecasts, forecast_mat
+
+# --- Diagnostic Utilities ---
+def run_metrics_plot(true_values, forecast_values, title, plot_and_print=True):
+    """Calculate and visualize forecast metrics"""
+    # Compute common forecast error metrics.
+    mae = mean_absolute_error(true_values, forecast_values)
+    mse = mean_squared_error(true_values, forecast_values)
+    rmse = np.sqrt(mse)
+    mape = np.mean(np.abs((true_values - forecast_values)/true_values)) * 100
+    mdape = np.median(np.abs((true_values - forecast_values)/true_values)) * 100
+    corr_demeaned, _ = pearsonr(true_values, forecast_values)
+    corr_raw = np.mean(true_values*forecast_values)/(np.sqrt(np.mean(true_values**2))*np.sqrt(np.mean(forecast_values**2)))
+
+    if plot_and_print:
+        # Print metrics and generate a plot comparing true vs. forecasted values.
+        print(f"MAE: {mae:.4f}, MSE: {mse:.4f}, RMSE: {rmse:.4f}")
+        print(f"MAPE: {mape:.2f}%, MdAPE: {mdape:.2f}%")
+        print(f"Correlations: Demeaned {corr_demeaned:.2f}, Raw {corr_raw:.2f}")
+
+        plt.figure(figsize=(12,6))
+        plt.plot(forecast_values.index, true_values, label='True Values', alpha=0.7)  
+        plt.plot(forecast_values.index, forecast_values, label='Forecasts', alpha=0.7) 
+        plt.title(title)
+        plt.legend()
+        plt.show()
+
+    return np.array([mae, mse, rmse, mape, mdape, corr_demeaned, corr_raw])
